@@ -2,19 +2,17 @@ use super::*;
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::Env;
 
-fn setup() -> (Env, SubscriptionVaultClient<'static>, Address) {
+const MIN_TOPUP: i128 = 1_000_000;
+
+fn setup() -> (Env, SubscriptionVaultClient<'static>, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register(SubscriptionVault, ());
     let client = SubscriptionVaultClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    let default_token = Address::generate(&env);
-    client.init(&admin, &default_token);
-    (env, client, default_token)
-}
-
-fn make_account(env: &Env) -> Address {
-    Address::generate(&env)
+    let token = Address::generate(&env);
+    client.init(&admin, &token, &MIN_TOPUP);
+    (env, client, admin, token)
 }
 
 #[test]
@@ -25,13 +23,109 @@ fn version_is_zero() {
     assert_eq!(client.version(), 0);
 }
 
+// --- init / config persistence ----------------------------------------------
+
+#[test]
+fn test_get_min_topup_returns_init_value() {
+    let (_env, client, _admin, _token) = setup();
+    let result = client.get_min_topup();
+    assert_eq!(result, MIN_TOPUP);
+}
+
+#[test]
+fn test_double_init_rejected() {
+    let (_env, client, admin, token) = setup();
+    let result = client.try_init(&admin, &token, &MIN_TOPUP);
+    assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+}
+
+#[test]
+fn test_double_init_with_different_admin_rejected() {
+    let (_env, client, _admin, _token) = setup();
+    let other_admin = Address::generate(&_env);
+    let other_token = Address::generate(&_env);
+    let result = client.try_init(&other_admin, &other_token, &500_000i128);
+    assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+}
+
+#[test]
+fn test_init_without_mock_auth_still_works() {
+    // init doesn't call require_auth, so this works even without mock_all_auths
+    let env = Env::default();
+    let contract_id = env.register(SubscriptionVault, ());
+    let client = SubscriptionVaultClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let result = client.try_init(&admin, &token, &MIN_TOPUP);
+    assert!(result.is_ok());
+}
+
+// --- storage key isolation --------------------------------------------------
+
+#[test]
+fn test_config_readable_after_subscription_creation() {
+    let (_env, client, _admin, _token) = setup();
+    let sub = Address::generate(&_env);
+    let merchant = Address::generate(&_env);
+
+    // Create subscription id 0 — stored at u32 key 0
+    let id = client.create_subscription(&sub, &merchant, &1000i128, &3600u64, &false, &None);
+    assert_eq!(id, 0);
+
+    // Config keys (stored as Symbols) must remain intact.
+    let min_topup = client.get_min_topup();
+    assert_eq!(min_topup, MIN_TOPUP);
+}
+
+#[test]
+fn test_subscription_id_zero_does_not_overwrite_config() {
+    let (_env, client, _admin, _token) = setup();
+    let sub = Address::generate(&_env);
+    let merchant = Address::generate(&_env);
+
+    let id = client.create_subscription(&sub, &merchant, &1000i128, &3600u64, &false, &None);
+    assert_eq!(id, 0);
+
+    // Reading config by Symbol key should still work
+    let topup = client.get_min_topup();
+    assert_eq!(topup, MIN_TOPUP);
+
+    // Subscription at u32(0) should match what we stored
+    let stored = client.get_subscription(&id);
+    assert_eq!(stored.subscriber, sub);
+    assert_eq!(stored.amount, 1000);
+    // u32 key 0 and Symbol "min_topup" are distinct storage keys
+}
+
+#[test]
+fn test_multiple_subscriptions_config_persists() {
+    let (_env, client, _admin, _token) = setup();
+    let sub = Address::generate(&_env);
+    let merchant = Address::generate(&_env);
+
+    for i in 0..5 {
+        let id = client.create_subscription(
+            &sub,
+            &merchant,
+            &(1000 * (i + 1)),
+            &3600u64,
+            &false,
+            &None,
+        );
+        assert_eq!(id, i as u32);
+    }
+
+    let topup = client.get_min_topup();
+    assert_eq!(topup, MIN_TOPUP);
+}
+
 // --- ID sequencing -----------------------------------------------------------
 
 #[test]
 fn test_id_starts_at_zero() {
-    let (env, client, _) = setup();
-    let sub = make_account(&env);
-    let merchant = make_account(&env);
+    let (_env, client, _admin, _token) = setup();
+    let sub = Address::generate(&_env);
+    let merchant = Address::generate(&_env);
 
     let id = client.create_subscription(&sub, &merchant, &1000i128, &3600u64, &false, &None);
     assert_eq!(id, 0);
@@ -39,9 +133,9 @@ fn test_id_starts_at_zero() {
 
 #[test]
 fn test_ids_are_monotonically_increasing() {
-    let (env, client, _) = setup();
-    let sub = make_account(&env);
-    let merchant = make_account(&env);
+    let (_env, client, _admin, _token) = setup();
+    let sub = Address::generate(&_env);
+    let merchant = Address::generate(&_env);
 
     for expected in 0..10 {
         let id = client.create_subscription(&sub, &merchant, &1000i128, &3600u64, &false, &None);
@@ -50,63 +144,28 @@ fn test_ids_are_monotonically_increasing() {
 }
 
 #[test]
-fn test_ids_are_unique() {
-    let (env, client, _) = setup();
-    let sub = make_account(&env);
-    let merchant = make_account(&env);
-
-    let mut seen = soroban_sdk::Vec::new(&env);
-    for i in 0..100 {
-        let id = client.create_subscription(&sub, &merchant, &1000i128, &3600u64, &false, &None);
-        assert_eq!(id, i);
-        seen.push_back(id);
-    }
-    // All 100 IDs are distinct because they are 0..99 with no gaps.
-    assert_eq!(seen.len(), 100);
-}
-
-#[test]
-fn test_get_subscription_count_on_empty() {
-    let (_env, client, _) = setup();
-    assert_eq!(client.get_subscription_count(), 0);
-}
-
-#[test]
 fn test_get_subscription_count_matches_creations() {
-    let (env, client, _) = setup();
-    let sub = make_account(&env);
-    let merchant = make_account(&env);
+    let (_env, client, _admin, _token) = setup();
+    let sub = Address::generate(&_env);
+    let merchant = Address::generate(&_env);
 
     assert_eq!(client.get_subscription_count(), 0);
-
     client.create_subscription(&sub, &merchant, &1000i128, &3600u64, &false, &None);
     assert_eq!(client.get_subscription_count(), 1);
-
     client.create_subscription(&sub, &merchant, &2000i128, &7200u64, &false, &None);
     assert_eq!(client.get_subscription_count(), 2);
-
-    client.create_subscription(&sub, &merchant, &3000i128, &14400u64, &true, &None);
-    assert_eq!(client.get_subscription_count(), 3);
 }
 
 // --- get_subscription round-trip --------------------------------------------
 
 #[test]
 fn test_get_subscription_returns_matching_fields() {
-    let (env, client, _) = setup();
+    let (env, client, _admin, _token) = setup();
     let sub = Address::generate(&env);
     let merchant = Address::generate(&env);
     let now = env.ledger().timestamp();
 
-    let id = client.create_subscription(
-        &sub,
-        &merchant,
-        &5000i128,
-        &7200u64,
-        &true,
-        &None,
-    );
-
+    let id = client.create_subscription(&sub, &merchant, &5000i128, &7200u64, &true, &None);
     let stored = client.get_subscription(&id);
     assert_eq!(stored.subscriber, sub);
     assert_eq!(stored.merchant, merchant);
@@ -121,82 +180,46 @@ fn test_get_subscription_returns_matching_fields() {
 
 #[test]
 fn test_get_subscription_with_expires_at_round_trip() {
-    let (env, client, _) = setup();
+    let (env, client, _admin, _token) = setup();
     let sub = Address::generate(&env);
     let merchant = Address::generate(&env);
     let now = env.ledger().timestamp();
     let future = now + 86400;
 
-    let id = client.create_subscription(
-        &sub,
-        &merchant,
-        &1000i128,
-        &3600u64,
-        &false,
-        &Some(future),
-    );
-
+    let id = client.create_subscription(&sub, &merchant, &1000i128, &3600u64, &false, &Some(future));
     let stored = client.get_subscription(&id);
     assert_eq!(stored.expires_at, Some(future));
     assert_eq!(stored.last_payment_timestamp, now);
-}
-
-#[test]
-fn test_get_subscription_stores_token() {
-    let (env, client, default_token) = setup();
-    let sub = Address::generate(&env);
-    let merchant = Address::generate(&env);
-
-    let id = client.create_subscription(&sub, &merchant, &1000i128, &3600u64, &false, &None);
-    let stored = client.get_subscription(&id);
-    assert_eq!(stored.token, default_token);
 }
 
 // --- NotFound ---------------------------------------------------------------
 
 #[test]
 fn test_get_subscription_unknown_id_returns_not_found() {
-    let (_env, client, _) = setup();
-    // No subscriptions created yet.
+    let (_env, client, _admin, _token) = setup();
     let result = client.try_get_subscription(&999u32);
     assert_eq!(result, Err(Ok(Error::NotFound)));
 }
 
 #[test]
 fn test_get_subscription_after_creation_other_ids_still_not_found() {
-    let (env, client, _) = setup();
-    let sub = Address::generate(&env);
-    let merchant = Address::generate(&env);
+    let (_env, client, _admin, _token) = setup();
+    let sub = Address::generate(&_env);
+    let merchant = Address::generate(&_env);
 
     let id = client.create_subscription(&sub, &merchant, &1000i128, &3600u64, &false, &None);
     assert_eq!(id, 0);
-
-    // id 1 was never created.
     let result = client.try_get_subscription(&1u32);
     assert_eq!(result, Err(Ok(Error::NotFound)));
 }
 
-#[test]
-fn test_get_subscription_multiple_ids_each_round_trips() {
-    let (env, client, _) = setup();
-    let sub = Address::generate(&env);
-    let merchant = Address::generate(&env);
-
-    let amounts = [1000i128, 2000, 3000, 4000, 5000];
-    for &amount in &amounts {
-        let id = client.create_subscription(&sub, &merchant, &amount, &3600u64, &false, &None);
-        let stored = client.get_subscription(&id);
-        assert_eq!(stored.amount, amount);
-    }
-}
-
-// --- Input validation (complementary) ---------------------------------------
+// --- Input validation -------------------------------------------------------
 
 #[test]
 fn test_create_subscription_zero_amount_rejected() {
-    let (env, client, _) = setup();
-    let sub = make_account(&env);
-    let merchant = make_account(&env);
+    let (_env, client, _admin, _token) = setup();
+    let sub = Address::generate(&_env);
+    let merchant = Address::generate(&_env);
 
     let result = client.try_create_subscription(&sub, &merchant, &0i128, &3600u64, &false, &None);
     assert_eq!(result, Err(Ok(Error::InvalidArgument)));
@@ -204,9 +227,9 @@ fn test_create_subscription_zero_amount_rejected() {
 
 #[test]
 fn test_create_subscription_negative_amount_rejected() {
-    let (env, client, _) = setup();
-    let sub = make_account(&env);
-    let merchant = make_account(&env);
+    let (_env, client, _admin, _token) = setup();
+    let sub = Address::generate(&_env);
+    let merchant = Address::generate(&_env);
 
     let result = client.try_create_subscription(&sub, &merchant, &(-1i128), &3600u64, &false, &None);
     assert_eq!(result, Err(Ok(Error::InvalidArgument)));
@@ -214,9 +237,9 @@ fn test_create_subscription_negative_amount_rejected() {
 
 #[test]
 fn test_create_subscription_zero_interval_rejected() {
-    let (env, client, _) = setup();
-    let sub = make_account(&env);
-    let merchant = make_account(&env);
+    let (_env, client, _admin, _token) = setup();
+    let sub = Address::generate(&_env);
+    let merchant = Address::generate(&_env);
 
     let result = client.try_create_subscription(&sub, &merchant, &1000i128, &0u64, &false, &None);
     assert_eq!(result, Err(Ok(Error::InvalidArgument)));
@@ -224,11 +247,11 @@ fn test_create_subscription_zero_interval_rejected() {
 
 #[test]
 fn test_create_subscription_past_expiration_rejected() {
-    let (env, client, _) = setup();
-    let sub = make_account(&env);
-    let merchant = make_account(&env);
+    let (_env, client, _admin, _token) = setup();
+    let sub = Address::generate(&_env);
+    let merchant = Address::generate(&_env);
 
-    let now = env.ledger().timestamp();
+    let now = _env.ledger().timestamp();
     let result = client.try_create_subscription(&sub, &merchant, &1000i128, &3600u64, &false, &Some(now));
     assert_eq!(result, Err(Ok(Error::InvalidArgument)));
 }

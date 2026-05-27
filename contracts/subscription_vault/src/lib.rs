@@ -10,6 +10,7 @@ pub const MAX_SUBSCRIPTION_ID: u32 = u32::MAX;
 pub enum Error {
     NotFound = 404,
     InvalidArgument = 3,
+    AlreadyInitialized = 4008,
     SubscriptionLimitReached = 429,
 }
 
@@ -42,9 +43,18 @@ pub struct SubscriptionVault;
 
 #[contractimpl]
 impl SubscriptionVault {
-    pub fn init(env: Env, admin: Address, default_token: Address) {
+    pub fn init(env: Env, admin: Address, token: Address, min_topup: i128) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .has(&Symbol::new(&env, "admin"))
+        {
+            return Err(Error::AlreadyInitialized);
+        }
         env.storage().instance().set(&Symbol::new(&env, "admin"), &admin);
-        env.storage().instance().set(&Symbol::new(&env, "token"), &default_token);
+        env.storage().instance().set(&Symbol::new(&env, "token"), &token);
+        env.storage().instance().set(&Symbol::new(&env, "min_topup"), &min_topup);
+        Ok(())
     }
 
     pub fn create_subscription(
@@ -97,6 +107,13 @@ impl SubscriptionVault {
         env.storage()
             .instance()
             .get(&id)
+            .ok_or(Error::NotFound)
+    }
+
+    pub fn get_min_topup(env: Env) -> Result<i128, Error> {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "min_topup"))
             .ok_or(Error::NotFound)
     }
 
