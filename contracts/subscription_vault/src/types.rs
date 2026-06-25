@@ -172,8 +172,8 @@ pub enum DataKey {
     BillingStatementSequence(u32),
     /// Aggregated totals from compacted billing statements.
     BillingStatementAggregate(u32),
-    /// Per-merchant scheduled payout configuration.
-    PayoutSchedule(Address),
+    /// Max concurrent active subscriptions allowed for a merchant.
+    MerchantMaxSubs(Address),
 }
 
 /// Represents the lifecycle state of a subscription.
@@ -1284,6 +1284,18 @@ pub struct PlanMaxActiveUpdatedEvent {
     pub timestamp: u64,
     /// Event schema version for backwards-compatible indexer decoding.
     pub schema_version: u32,
+}
+
+/// Event emitted when a merchant's max-subscriptions limit is updated.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MerchantMaxSubsUpdatedEvent {
+    /// Merchant whose limit was changed.
+    pub merchant: Address,
+    /// New limit value (`u32::MAX` = unlimited).
+    pub max_subs: u32,
+    /// Ledger timestamp when the change was applied.
+    pub timestamp: u64,
 }
 
 /// Event emitted when a subscription is migrated from one plan template
