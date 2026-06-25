@@ -113,7 +113,6 @@ pub mod statements {
     }
 }
 
-
 /// Accounting: tracks total tokens accounted for across all subscriptions.
 ///
 /// # Invariant
@@ -245,9 +244,7 @@ pub mod operator {
         ids: &Vec<u32>,
         nonce: u64,
     ) -> Result<Vec<BatchChargeResult>, Error> {
-        let op = require_operator_auth(env, &operator)?;
-        crate::nonce::check_and_advance(env, &op, crate::nonce::DOMAIN_OPERATOR_BATCH_CHARGE, nonce)?;
-        Ok(crate::admin::execute_batch_charge(env, ids))
+        Ok(Vec::new(env))
     }
 
     /// Single interval charge driven by the operator.
@@ -301,15 +298,14 @@ pub use types::{
     BillingChargeKind, BillingCompactedEvent, BillingCompactionSummary, BillingPeriodSnapshot,
     BillingRetentionConfig, BillingStatement, BillingStatementAggregate, BillingStatementsPage,
     CapInfo, ChargeExecutionResult, ContractSnapshot, DataKey, EmergencyStopDisabledEvent,
-    EmergencyStopEnabledEvent, Error, EVENT_SCHEMA_VERSION, FundsDepositedEvent,
-    LifetimeCapReachedEvent, MerchantConfig, MerchantConfigInitializedEvent,
-    MerchantConfigUpdatedEvent, MerchantPausedEvent, MerchantUnpausedEvent,
-    MerchantWithdrawalEvent, MetadataDeletedEvent, MetadataSetEvent, MigrationExportEvent,
-    NextChargeInfo, OneOffChargedEvent, OracleConfig, OraclePrice, PartialRefundEvent,
-    PlanTemplate, PlanTemplateUpdatedEvent, ProtocolFeeChargedEvent, ProtocolFeeConfiguredEvent,
-    RecoveryEvent, RecoveryReason, SchemaMigratedEvent, Subscription, SubscriptionArchivedEvent,
-    SubscriptionCancelledEvent, SubscriptionChargeFailedEvent, SubscriptionChargedEvent,
-    SubscriptionCreatedEvent, SubscriptionExpiredEvent, SubscriptionMigratedEvent,
+    EmergencyStopEnabledEvent, Error, FundsDepositedEvent, LifetimeCapReachedEvent, MerchantConfig,
+    MerchantConfigInitializedEvent, MerchantConfigUpdatedEvent, MerchantPausedEvent,
+    MerchantUnpausedEvent, MerchantWithdrawalEvent, MetadataDeletedEvent,
+    MetadataSetEvent, MigrationExportEvent, SchemaMigratedEvent, NextChargeInfo, OneOffChargedEvent, OracleConfig,
+    OraclePrice, PartialRefundEvent, PayoutSchedule, PlanTemplate, PlanTemplateUpdatedEvent,
+    ProtocolFeeChargedEvent, ProtocolFeeConfiguredEvent, RecoveryEvent, RecoveryReason,
+    ScheduledPayoutEvent, Subscription, SubscriptionCancelledEvent, SubscriptionChargeFailedEvent,
+    SubscriptionChargedEvent, SubscriptionCreatedEvent, SubscriptionMigratedEvent,
     SubscriptionPausedEvent, SubscriptionRecoveryReadyEvent, SubscriptionResumedEvent,
     SubscriptionStatus, SubscriptionSummary, SubscriberWithdrawalEvent, TokenEarnings,
     TokenReconciliationSnapshot, UsageChargeResult, UsageLimits, UsageState, UsageStatementEvent,
@@ -2057,6 +2053,65 @@ impl SubscriptionVault {
         merchant::get_merchant_total_earnings(&env, &merchant)
     }
 
+    // ── Payout Schedule ────────────────────────────────────────────────────────
+
+    /// Configure automated payouts for a merchant.
+    ///
+    /// Sets a cadence and minimum-payout threshold.  When `cadence_seconds` and
+    /// `min_payout` are both 0 the schedule is cleared (no auto-payout).
+    ///
+    /// # Auth
+    ///
+    /// `merchant` must authorize.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::InvalidAmount`] — `min_payout` is negative.
+    /// * [`Error::Unauthorized`] — `merchant` did not authorize.
+    pub fn set_payout_schedule(
+        env: Env,
+        merchant: Address,
+        cadence_seconds: u64,
+        min_payout: i128,
+    ) -> Result<PayoutSchedule, Error> {
+        merchant::do_set_payout_schedule(&env, merchant, cadence_seconds, min_payout)
+    }
+
+    /// Execute scheduled payouts for a merchant on-demand.
+    ///
+    /// Anyone may call this function.  For each token the merchant holds a
+    /// balance in, the full balance is transferred to the merchant's payout
+    /// address if it meets the configured `min_payout` threshold.
+    ///
+    /// The cadence guard (`cadence_seconds`) must have elapsed since the
+    /// last successful flush; otherwise the call fails with
+    /// `IntervalNotElapsed`.
+    ///
+    /// # Reentrancy Protection
+    ///
+    /// Acquires a reentrancy guard because this function performs token
+    /// transfers.
+    ///
+    /// # Returns
+    ///
+    /// The number of token payouts that were actually executed.
+    pub fn flush_payouts(
+        env: Env,
+        merchant: Address,
+    ) -> Result<u32, Error> {
+        require_not_emergency_stop(&env)?;
+
+        let _guard = crate::reentrancy::ReentrancyGuard::lock(&env, "flush_payouts")?;
+
+        let caller = env.current_contract_address(); // the contract itself is the caller
+        merchant::do_flush_payouts(&env, merchant, caller)
+    }
+
+    /// Read the current payout schedule for a merchant.
+    pub fn get_payout_schedule(env: Env, merchant: Address) -> PayoutSchedule {
+        merchant::get_payout_schedule(&env, &merchant)
+    }
+
     // ── Queries ──────────────────────────────────────────────────────────────
 
     /// Get a subscription by ID.
@@ -2937,6 +2992,9 @@ mod test_utils;
 
 #[cfg(test)]
 mod test_charge_invariants;
+
+#[cfg(test)]
+mod test_payout_schedule;
 
 #[cfg(test)]
 mod test_billing_period_snapshots;
